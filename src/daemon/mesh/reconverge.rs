@@ -637,7 +637,7 @@ async fn commit_group_blob(
     apply_suggested_firewall(firewall, my_identity, network_name, state);
     // The mirror of the prune: a peer we are already connected to that this roster
     // now lists, but whose connection never got registered for this network.
-    attach_rejoined_peers(peers, device_user_map, &roster, network_name, my_identity).await;
+    attach_rejoined_peers(peers, device_user_map, state, network_name, my_identity).await;
     // If a local rename is still unconfirmed by this just-applied blob, keep
     // delivering it to the coordinator set until it lands.
     drain_pending_rename(&roster, network_name, my_identity, device_cert, registry).await;
@@ -756,25 +756,48 @@ pub(crate) fn revoke_peer_network(
 pub(crate) async fn attach_rejoined_peers(
     peers: &PeerTable,
     device_user_map: &peers::DeviceUserMap,
-    members: &MemberList,
+    state: &SharedNetworkState,
     network_name: &str,
     my_identity: EndpointId,
 ) {
-    for m in members {
-        if m.identity == my_identity {
+    // Walk connections rather than choosing one connection per roster identity:
+    // several paired devices can share a primary, and every authorized device
+    // needs the repair. The mapping can remain valid on another network after
+    // this one nullifies a device, so it is not by itself an admission grant.
+    for (ip, conn) in peers.all_connections() {
+        let peer_id = conn.remote_id();
+        if peer_id == my_identity {
             continue;
         }
-        // The roster keys a paired peer by its user identity, while the peer table
-        // is keyed on the transport (device) id, so resolve through the same map
-        // the prune pass uses before looking the connection up.
-        let Some((ip, conn)) = peers.connected_device_for(&m.identity, device_user_map) else {
-            continue;
-        };
-        if peers.attach_network(&ip, network_name).is_none() {
-            continue;
+        {
+            // Roster publication and DNS work can yield before this repair.
+            // Recheck the current state and attach under the same read guard,
+            // so an older repair cannot undo a concurrent kick or revocation.
+            let state = state.read().unwrap();
+            if state.destroyed {
+                continue;
+            }
+            let members = &state.group.members;
+            let user_id = device_user_map.resolve(&peer_id);
+            let independent = members.get(&peer_id).is_some_and(|member| {
+                member.user_identity.is_none() && member.device_cert.is_none()
+            });
+            let authorized = if state.group.nullifiers.contains(&peer_id) {
+                if independent {
+                    // Independent admission must not retain the revoked primary's
+                    // firewall or SSH identity. Match the prune and hello paths.
+                    device_user_map.remove(&peer_id);
+                }
+                independent
+            } else {
+                members.is_member(&peer_id) || members.is_member(&user_id)
+            };
+            if !authorized || peers.attach_network(&ip, network_name).is_none() {
+                continue;
+            }
         }
         tracing::info!(
-            peer = %m.identity.fmt_short(),
+            peer = %peer_id.fmt_short(),
             network = %network_name,
             "attached an existing connection to a network its handshake missed"
         );
@@ -1123,5 +1146,168 @@ mod reconverge_tests {
         );
         server.close().await;
         client.close().await;
+    }
+
+    #[tokio::test]
+    async fn roster_repair_does_not_readmit_a_nullified_device_through_its_primary() {
+        let (server, client, conn, _remote) = connected_pair().await;
+        let device = conn.remote_id();
+        let ip = derive_ipv6(&device);
+        let primary = SecretKey::generate().public();
+        let peers = PeerTable::new();
+        peers.add(ip, conn.clone(), device, "test-network");
+        peers.add(ip, conn, device, "other-network");
+        let device_user_map = peers::DeviceUserMap::new();
+        device_user_map.insert(device, primary);
+        let state = state_with_members(vec![member(primary, false)]);
+        state.write().unwrap().group.nullifiers.insert(device);
+
+        prune_departed_peers(
+            &peers,
+            &device_user_map,
+            &Arc::new(DashSet::new()),
+            &state,
+            "test-network",
+            server.id(),
+        );
+        assert!(!peers.shares_network_v6(&ip, "test-network"));
+        assert!(peers.shares_network_v6(&ip, "other-network"));
+        assert_eq!(device_user_map.resolve(&device), primary);
+        attach_rejoined_peers(
+            &peers,
+            &device_user_map,
+            &state,
+            "test-network",
+            server.id(),
+        )
+        .await;
+        assert!(
+            !peers.shares_network_v6(&ip, "test-network"),
+            "a mapping retained for another network cannot undo this network's revocation"
+        );
+        assert!(peers.shares_network_v6(&ip, "other-network"));
+
+        // Revoking a certificate does not revoke an independently admitted row.
+        state.write().unwrap().group.members = MemberList::from(vec![member(device, false)]);
+        attach_rejoined_peers(
+            &peers,
+            &device_user_map,
+            &state,
+            "test-network",
+            server.id(),
+        )
+        .await;
+        assert!(peers.shares_network_v6(&ip, "test-network"));
+        assert_eq!(device_user_map.resolve(&device), device);
+        server.close().await;
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn roster_repair_rechecks_membership_after_an_announcement_wait() {
+        let (server_a, client_a, conn_a, _remote_a) = connected_pair().await;
+        let (server_b, client_b, conn_b, _remote_b) = connected_pair().await;
+        let devices = [conn_a.remote_id(), conn_b.remote_id()];
+        let primary = SecretKey::generate().public();
+        let device_user_map = peers::DeviceUserMap::new();
+        for device in devices {
+            device_user_map.insert(device, primary);
+        }
+
+        for change in ["kick", "revoke", "destroy"] {
+            let peers = PeerTable::new();
+            for (device, conn) in devices.into_iter().zip([conn_a.clone(), conn_b.clone()]) {
+                peers.add(derive_ipv6(&device), conn, device, "other-network");
+            }
+            let state = state_with_members(vec![member(primary, false)]);
+            // Whichever peer is visited first, pause its announcement after it
+            // is attached. The second peer must still be checked after the wait.
+            let target_a = peers.announce_target(&derive_ipv6(&devices[0])).unwrap();
+            let target_b = peers.announce_target(&derive_ipv6(&devices[1])).unwrap();
+            let blocked_a = target_a.lock.lock().await;
+            let blocked_b = target_b.lock.lock().await;
+            let repair = attach_rejoined_peers(
+                &peers,
+                &device_user_map,
+                &state,
+                "test-network",
+                server_a.id(),
+            );
+            tokio::pin!(repair);
+            assert!(futures::poll!(&mut repair).is_pending());
+            assert_eq!(
+                devices
+                    .iter()
+                    .filter(|device| {
+                        peers.shares_network_v6(&derive_ipv6(device), "test-network")
+                    })
+                    .count(),
+                1,
+                "repair must attach one peer before waiting on its announcement"
+            );
+            {
+                let mut state = state.write().unwrap();
+                match change {
+                    "kick" => {
+                        state.group.members.remove(&primary);
+                    }
+                    "revoke" => {
+                        state.group.nullifiers.extend(devices);
+                    }
+                    "destroy" => state.destroyed = true,
+                    _ => unreachable!(),
+                }
+            }
+            // Model the connection cleanup accompanying the new roster or
+            // network teardown while retaining both peers' other network.
+            peers.remove_by_network("test-network");
+            drop(blocked_a);
+            drop(blocked_b);
+            tokio::time::timeout(Duration::from_secs(2), &mut repair)
+                .await
+                .expect("repair resumes after its announcement is released");
+            for device in devices {
+                let ip = derive_ipv6(&device);
+                assert!(
+                    !peers.shares_network_v6(&ip, "test-network"),
+                    "a resumed repair must not undo {change}"
+                );
+                assert!(peers.shares_network_v6(&ip, "other-network"));
+            }
+        }
+        server_a.close().await;
+        client_a.close().await;
+        server_b.close().await;
+        client_b.close().await;
+    }
+
+    #[tokio::test]
+    async fn roster_repair_attaches_every_authorized_device_of_a_primary() {
+        let (server_a, client_a, conn_a, _remote_a) = connected_pair().await;
+        let (server_b, client_b, conn_b, _remote_b) = connected_pair().await;
+        let devices = [conn_a.remote_id(), conn_b.remote_id()];
+        let primary = SecretKey::generate().public();
+        let peers = PeerTable::new();
+        let device_user_map = peers::DeviceUserMap::new();
+        for (device, conn) in devices.into_iter().zip([conn_a, conn_b]) {
+            peers.add(derive_ipv6(&device), conn, device, "other-network");
+            device_user_map.insert(device, primary);
+        }
+        attach_rejoined_peers(
+            &peers,
+            &device_user_map,
+            &state_with_members(vec![member(primary, false)]),
+            "test-network",
+            server_a.id(),
+        )
+        .await;
+        for device in devices {
+            assert!(peers.shares_network_v6(&derive_ipv6(&device), "test-network"));
+            assert!(peers.shares_network_v6(&derive_ipv6(&device), "other-network"));
+        }
+        server_a.close().await;
+        client_a.close().await;
+        server_b.close().await;
+        client_b.close().await;
     }
 }

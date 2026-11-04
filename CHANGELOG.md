@@ -6,10 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Roster refresh restores connections for every paired device of a member,
+  rather than only one.
+
 ### Security
 
 - Files from different senders no longer share receive or restart state when
   their offers use the same identifier.
+- A device revoked from one network no longer regains access during roster
+  refresh while it remains connected on another network. A device admitted
+  independently after revocation no longer retains its former primary's
+  firewall or SSH identity.
 
 ## [0.5.15] - 2026-11-03
 
