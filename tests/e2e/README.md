@@ -53,9 +53,10 @@ The throughput/latency benchmark (`tests/e2e.sh bench`) is a sibling suite
 under [`../bench/`](../bench) (same shared `tests/lib/`).
 
 Run `bash tests/test-e2e-harness.sh` to check daemon activation, listener readiness,
-probe errors, bounded diagnostics, cleanup retries, and unknown-peer failures
-without Docker or cloud credentials. It includes the focused cleanup and connect
-regression scripts. These checks also run in CI.
+probe errors, bounded diagnostics, cleanup retries, unknown-peer failures, and
+reliability measurement validation without Docker or cloud credentials. It
+includes the focused cleanup, connect, invite, and reliability regression
+scripts. These checks also run in CI.
 
 ## Local rootless scenario
 

@@ -28,23 +28,25 @@ IP:
 One additional WebSocket test sends repeated small replies and messages up to
 1 MiB from srv-b to srv-a. Every frame is checked; a 10-second stall fails.
 
-A probe **FAILs** only when the rayfish-path loss exceeds the direct-path loss by
-more than `MARGIN` percentage points (default `0.5`), so genuine internet drops
-on the underlying link aren't blamed on rayfish. Direct loss is always reported.
-A per-run markdown table is saved under `results/`.
+A probe **FAILs** when the rayfish-path loss exceeds the direct-path loss by more
+than `MARGIN` percentage points (default `0.5`), so genuine internet drops on
+the underlying link aren't blamed on rayfish. Both paths must return a valid
+percentage: missing or malformed results fail as measurement errors, rather
+than being treated as zero loss. Direct loss is always reported. A per-run
+markdown table is saved under `results/`.
 
 ## First-run findings (4× DEV1-S in fr-par-1, the fleet this suite ran on then)
 
 - **ICMP burst and flood: 0% loss over the rayfish tunnel on every directed pair**
   (12/12), matching the direct baseline. The datagram data path holds up under
   sustained ICMP load between cloud servers.
-- **Known limitation — iperf3 UDP over the tunnel returns no measurement.** The
-  direct path measures fine, but over the TUN the `iperf3 -u` run yields no
-  `lost_percent` (so the probe currently reports a FAIL). This is almost
-  certainly iperf3's default UDP datagram size (~1460B) exceeding the TUN's
-  1280-byte MTU; the likely fix is pinning `-l 1200` on the UDP run. Until that
-  is verified on live hosts, treat the iperf3-UDP result as a harness gap, not as
-  evidence of VPN packet loss.
+- **No UDP measurement was collected in that run.** The direct path measured
+  fine, but the TUN path yielded no `lost_percent`, so that run provides no UDP
+  packet-loss conclusion. Linux creates its TUN with a 1280-byte MTU; the mesh
+  accepts IP packets up to 1500 bytes and fragments them when a QUIC path's
+  datagram budget is smaller. Those are separate limits, and neither alone
+  establishes why iperf3 returned no measurement. Reproduce and inspect the
+  iperf3, firewall and transport errors before attributing it to packet loss.
 
 ## Environment overrides
 

@@ -20,7 +20,8 @@
 # top of the raw link points at the protocol (congestion control, MTU, relay
 # fallback, reader backpressure). To avoid blaming rayfish for genuine internet
 # drops, a probe FAILs only when the rayfish-path loss exceeds the direct-path
-# loss by more than $MARGIN percentage points; direct loss is always reported.
+# loss by more than $MARGIN percentage points. Both paths must produce valid
+# measurements; direct loss is always reported.
 #
 # Reads tests/e2e/reliability/.servers (written by provision.sh). Does NOT modify
 # infra. Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
@@ -60,13 +61,20 @@ done
 
 # ping_loss_n <from-pub-ip> <target-ip> <count> <interval> : ICMP loss %.
 ping_loss_n(){
-  on "$1" "ping -c $3 -i $4 -W 2 $2" 2>/dev/null \
+  local output rc=0
+  output="$(on "$1" "ping -c $3 -i $4 -W 2 $2" 2>/dev/null)" || rc=$?
+  # ping exits 1 for total loss. SSH and command failures are not measurements.
+  [[ "$rc" == 0 || "$rc" == 1 ]] || return 1
+  printf '%s\n' "$output" \
     | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+'
 }
 
 # ping_flood <from-pub-ip> <target-ip> <count> : ICMP flood loss % (needs root).
 ping_flood(){
-  on "$1" "ping -f -c $3 -W 2 $2" 2>/dev/null \
+  local output rc=0
+  output="$(on "$1" "ping -f -c $3 -W 2 $2" 2>/dev/null)" || rc=$?
+  [[ "$rc" == 0 || "$rc" == 1 ]] || return 1
+  printf '%s\n' "$output" \
     | grep -oE '[0-9.]+% packet loss' | grep -oE '^[0-9.]+'
 }
 
@@ -75,26 +83,36 @@ ping_flood(){
 # address the client targets, so the datagrams ride the chosen path.
 iperf_udp_loss(){
   local client="$1" listen="$2" server="$3"
-  on "$server" "systemctl stop ipsrv 2>/dev/null; systemctl reset-failed ipsrv 2>/dev/null; systemd-run --unit=ipsrv --quiet iperf3 -s -p 5201 -B $listen; sleep 1"
-  local json; json="$(on "$client" "iperf3 -c $listen -p 5201 -u -b $RATE -t $DURATION -J" 2>/dev/null)"
+  local json="" measured=0
+  if on "$server" "systemctl stop ipsrv 2>/dev/null; systemctl reset-failed ipsrv 2>/dev/null; systemd-run --unit=ipsrv --quiet iperf3 -s -p 5201 -B $listen && sleep 1"; then
+    if json="$(on "$client" "iperf3 -c $listen -p 5201 -u -b $RATE -t $DURATION -J" 2>/dev/null)"; then
+      measured=1
+    fi
+  fi
   on "$server" "systemctl stop ipsrv 2>/dev/null; systemctl reset-failed ipsrv 2>/dev/null" || true
+  [[ "$measured" == 1 ]] || return 1
   echo "$json" | jq -r '(.end.sum.lost_percent // empty)' 2>/dev/null
 }
 
+# valid_loss <loss> : a measured percentage, not an empty or malformed result.
+valid_loss(){
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] \
+    && awk -v loss="$1" 'BEGIN{exit !(loss >= 0 && loss <= 100)}'
+}
+
 # worse_by_margin <rayfish-loss> <direct-loss> : exit 0 if rayfish exceeds direct
-# by more than $MARGIN percentage points (treats empty rayfish loss as a failure
-# to measure -> worse; empty direct as 0).
+# by more than $MARGIN percentage points. Called only with valid measurements.
 worse_by_margin(){
   local r="$1" d="$2"
-  [[ -n "$r" ]] || return 0
-  [[ -n "$d" ]] || d=0
   awk -v r="$r" -v d="$d" -v m="$MARGIN" 'BEGIN{exit !(r > d + m)}'
 }
 
 # assert_loss <label> <rayfish-loss> <direct-loss> : PASS/FAIL by the margin rule.
 assert_loss(){
   local label="$1" r="$2" d="$3"
-  if worse_by_margin "$r" "$d"; then
+  if ! valid_loss "$r" || ! valid_loss "$d"; then
+    fail "$label  measurement unavailable or invalid: rayfish=${r:-?}%  direct=${d:-?}%"
+  elif worse_by_margin "$r" "$d"; then
     fail "$label  rayfish=${r:-?}%  direct=${d:-?}%  (> direct + ${MARGIN}pp)"
   else
     pass "$label  rayfish=${r:-?}%  direct=${d:-?}%"
@@ -170,15 +188,18 @@ probe_pair(){
   local fp="${PUBS[$fi]}" tp="${PUBS[$ti]}" tv="${VPNS[$ti]}"
 
   local r d
-  r="$(ping_loss_n "$fp" "$tv" "$PING_COUNT" 0.01)"; d="$(ping_loss_n "$fp" "$tp" "$PING_COUNT" 0.01)"
+  r="$(ping_loss_n "$fp" "$tv" "$PING_COUNT" 0.01)" || r=""
+  d="$(ping_loss_n "$fp" "$tp" "$PING_COUNT" 0.01)" || d=""
   assert_loss "$from -> $to  icmp  (-c $PING_COUNT -i 0.01)" "$r" "$d"
   printf '%s\t%s\ticmp\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 
-  r="$(ping_flood "$fp" "$tv" "$FLOOD_COUNT")"; d="$(ping_flood "$fp" "$tp" "$FLOOD_COUNT")"
+  r="$(ping_flood "$fp" "$tv" "$FLOOD_COUNT")" || r=""
+  d="$(ping_flood "$fp" "$tp" "$FLOOD_COUNT")" || d=""
   assert_loss "$from -> $to  flood (-f -c $FLOOD_COUNT)" "$r" "$d"
   printf '%s\t%s\tflood\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 
-  r="$(iperf_udp_loss "$fp" "$tv" "$tp")"; d="$(iperf_udp_loss "$fp" "$tp" "$tp")"
+  r="$(iperf_udp_loss "$fp" "$tv" "$tp")" || r=""
+  d="$(iperf_udp_loss "$fp" "$tp" "$tp")" || d=""
   assert_loss "$from -> $to  iperf-udp (-b $RATE -t ${DURATION}s)" "$r" "$d"
   printf '%s\t%s\tudp\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 }
