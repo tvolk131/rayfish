@@ -39,7 +39,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       # `save-if` on master only. Every job here writes half a gigabyte or more
       # of target dir, and a cache written on a pull request branch is readable

@@ -209,8 +209,8 @@ release:
     cargo -q build --release
 
 fmt:
-    cargo fmt
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo fmt --all
+    cargo -q clippy --workspace --all-targets --all-features -- -D warnings
     # cargo shear --fix # cargo install shear
 
 # Format only the .rs files you have actually touched (modified or new).
@@ -276,7 +276,7 @@ scp-dev ip:
     @echo "Deployed and installed daemon on {{ip}} (debug build)"
 
 check:
-    cargo -q check
+    cargo -q check --workspace --all-targets
 
 run *args:
     sudo cargo -q run -- {{args}}
