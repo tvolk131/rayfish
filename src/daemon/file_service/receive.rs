@@ -235,7 +235,6 @@ impl FileService {
         let finish = transfers::FinishGuard::new(Arc::clone(&self.transfers), transfer_id);
         let offer = ReceiveOfferGuard {
             shutdown: self.registry.shutdown_token.clone(),
-            offer_id: file.offer_id,
             file: Some(file.clone()),
             pending: Arc::clone(&self.pending_files),
             active: Arc::clone(&self.active_files),
@@ -257,8 +256,8 @@ impl FileService {
         let before_rename = {
             let pending = Arc::clone(&self.pending_files);
             let active = Arc::clone(&self.active_files);
-            let offer_id = file.offer_id;
-            move |name: &str| note_saving_as(&pending, &active, offer_id, name)
+            let id = file.id;
+            move |name: &str| note_saving_as(&pending, &active, id, name)
         };
         tokio::spawn(async move {
             // Biased so a receive that finished in the same poll as a cancel
@@ -342,7 +341,7 @@ impl FileService {
             }
         };
         let recorded = self.record_completed_offer(&file);
-        self.forget_active(offer.offer_id);
+        self.forget_active(id);
         // The file is where the user wanted it, so the store's copy is now pure
         // duplication: every accepted file used to be kept twice, forever.
         self.reclaim_blob(blob_tags::recv(&file.blob_hash, file.id));
@@ -365,10 +364,10 @@ impl FileService {
     }
 
     /// Drop a finished receive from the active list and the saved queue.
-    fn forget_active(&self, offer_id: control::FileOfferId) {
+    fn forget_active(&self, id: u64) {
         let pending = self.pending_files.lock().unwrap();
         let mut active = self.active_files.lock().unwrap();
-        active.retain(|entry| entry.offer_id != offer_id);
+        active.retain(|entry| entry.id != id);
         let durable: Vec<_> = pending.iter().chain(active.iter()).cloned().collect();
         if let Err(error) = save_pending_files(&durable) {
             tracing::warn!(%error, "could not persist completed incoming file");

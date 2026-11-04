@@ -319,7 +319,6 @@ struct ReceiveOfferGuard {
     shutdown: CancellationToken,
     pending: Arc<Mutex<Vec<PendingFile>>>,
     active: Arc<Mutex<Vec<PendingFile>>>,
-    offer_id: control::FileOfferId,
     transfers: Arc<transfers::TransferRegistry>,
     store: FsStore,
 }
@@ -332,13 +331,13 @@ impl Drop for ReceiveOfferGuard {
             if self.shutdown.is_cancelled() {
                 // The active entry is the latest word on where it is going,
                 // including any name it was being saved under.
-                if let Some(current) = active.iter().find(|entry| entry.offer_id == self.offer_id) {
+                if let Some(current) = active.iter().find(|entry| entry.id == file.id) {
                     file.accepted.clone_from(&current.accepted);
                 }
             } else {
                 file.accepted = None;
             }
-            active.retain(|entry| entry.offer_id != self.offer_id);
+            active.retain(|entry| entry.id != file.id);
             make_room(&mut queue, &self.store);
             queue.push(file);
             let durable: Vec<_> = queue.iter().chain(active.iter()).cloned().collect();
@@ -496,21 +495,22 @@ fn load_pending_files() -> Vec<PendingFile> {
     }
 }
 
-/// Save that accepted receive `offer_id` is about to be renamed to `name`,
+/// Save that accepted receive `id` is about to be renamed to `name`,
 /// for [`AcceptedReceive::saved_as`]. Runs on the blocking pool with the
 /// rename. A failure is logged and the rename goes ahead: failing the receive
 /// would put the offer back to be downloaded and saved again anyway.
+/// The receiver assigns `id`; a sender's wire offer id is unique only to it.
 fn note_saving_as(
     pending: &Mutex<Vec<PendingFile>>,
     active: &Mutex<Vec<PendingFile>>,
-    offer_id: control::FileOfferId,
+    id: u64,
     name: &str,
 ) {
     let pending = pending.lock().unwrap();
     let mut active = active.lock().unwrap();
     let Some(accepted) = active
         .iter_mut()
-        .find(|entry| entry.offer_id == offer_id)
+        .find(|entry| entry.id == id)
         .and_then(|entry| entry.accepted.as_mut())
     else {
         return;
@@ -2466,14 +2466,12 @@ mod tests {
         let service = file_service(endpoint, &tmp.path().join("receiver")).await;
         let first = pending(1);
         let from = first.from;
-        let offer_id = first.offer_id;
         service.queue_incoming_offer(from, first);
         let file = take_pending(&mut service.pending_files.lock().unwrap(), 1).unwrap();
         service.active_files.lock().unwrap().push(file.clone());
         let guard = ReceiveOfferGuard {
             shutdown: CancellationToken::new(),
             file: Some(file),
-            offer_id,
             pending: Arc::clone(&service.pending_files),
             active: Arc::clone(&service.active_files),
             transfers: Arc::clone(&service.transfers),
@@ -2489,6 +2487,72 @@ mod tests {
         drop(guard);
         assert!(service.active_files.lock().unwrap().is_empty());
         assert_eq!(service.pending_files.lock().unwrap().len(), 2);
+        assert_eq!(load_pending_files().len(), 2);
+    }
+
+    /// Offer ids are chosen by senders. Even deliberately identical ids from
+    /// different peers must not share rename or shutdown-recovery state.
+    #[tokio::test]
+    async fn matching_wire_offer_ids_keep_separate_receive_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        config::set_thread_config_dir(tmp.path().join("config"));
+        let endpoint = file_endpoint(iroh::address_lookup::memory::MemoryLookup::new()).await;
+        let service = file_service(endpoint, &tmp.path().join("receiver")).await;
+        let destination = |output: &str| AcceptedReceive {
+            output: Some(output.to_string()),
+            recipient: Recipient {
+                owner: None,
+                caller_chose_dir: true,
+                #[cfg(windows)]
+                caller: WindowsCaller::System,
+            },
+            saved_as: None,
+        };
+        let mut first = pending(1);
+        first.accepted = Some(destination("first"));
+        let mut second = pending(2);
+        second.offer_id = first.offer_id;
+        second.accepted = Some(destination("second"));
+        service
+            .active_files
+            .lock()
+            .unwrap()
+            .extend([first, second.clone()]);
+
+        note_saving_as(
+            &service.pending_files,
+            &service.active_files,
+            2,
+            "second.bin",
+        );
+        {
+            let active = service.active_files.lock().unwrap();
+            assert_eq!(active[0].accepted.as_ref().unwrap().saved_as, None);
+            assert_eq!(
+                active[1].accepted.as_ref().unwrap().saved_as.as_deref(),
+                Some("second.bin")
+            );
+        }
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        drop(ReceiveOfferGuard {
+            shutdown,
+            file: Some(second),
+            pending: Arc::clone(&service.pending_files),
+            active: Arc::clone(&service.active_files),
+            transfers: Arc::clone(&service.transfers),
+            store: service.transport.blob_store.clone(),
+        });
+        {
+            let active = service.active_files.lock().unwrap();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, 1);
+        }
+        let pending = service.pending_files.lock().unwrap();
+        let accepted = pending[0].accepted.as_ref().unwrap();
+        assert_eq!(accepted.output.as_deref(), Some("second"));
+        assert_eq!(accepted.saved_as.as_deref(), Some("second.bin"));
         assert_eq!(load_pending_files().len(), 2);
     }
 
@@ -2832,7 +2896,6 @@ mod tests {
             file: take_pending(&mut queue.lock().unwrap(), 1),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
-            offer_id: control::FileOfferId::new(),
             transfers,
             store: store.clone(),
         };
@@ -2864,7 +2927,6 @@ mod tests {
             file: Some(pending(1)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
-            offer_id: control::FileOfferId::new(),
             transfers: Arc::new(transfers::TransferRegistry::new()),
             store,
         };
@@ -2897,7 +2959,6 @@ mod tests {
             file: Some(pending(999)),
             pending: Arc::clone(&queue),
             active: Arc::new(Mutex::new(Vec::new())),
-            offer_id: control::FileOfferId::new(),
             transfers: Arc::new(transfers::TransferRegistry::new()),
             store: store.clone(),
         };
@@ -3134,6 +3195,35 @@ mod tests {
         std::mem::forget(tag);
         service.queue_incoming_offer(file.from, file);
         service
+    }
+
+    /// Completing one receive must not remove an active offer from a second
+    /// sender that chose the same wire offer id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completing_a_receive_keeps_another_senders_matching_offer_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = cached_offer(tmp.path()).await;
+        let mut second = pending(2);
+        second.offer_id = service.pending_files.lock().unwrap()[0].offer_id;
+        service.active_files.lock().unwrap().push(second);
+        let downloads = tmp.path().join("downloads");
+
+        service
+            .accept_file(1, Some(downloads.to_string_lossy().into_owned()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(downloads.join("file.bin")).unwrap(),
+            b"payload"
+        );
+        let active = service.active_files.lock().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, 2);
+        let saved = load_pending_files();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, 2);
     }
 
     #[cfg(unix)]

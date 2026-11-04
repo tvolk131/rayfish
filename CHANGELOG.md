@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Files from different senders no longer share receive or restart state when
+  their offers use the same identifier.
+
 ## [0.5.15] - 2026-11-03
 
 ### Fixed
