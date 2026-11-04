@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ray netcheck --explain` describes the endpoint's observations and suggests
+  troubleshooting steps. With `--json`, it includes structured advice.
+
 ### Fixed
 
 - Roster refresh restores connections for every paired device of a member,

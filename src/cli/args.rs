@@ -402,6 +402,9 @@ pub(crate) enum Command {
     /// Bound UDP port, home relay and its latency, public addresses, and
     /// IPv4/IPv6/UDP reachability.
     Netcheck {
+        /// Explain the observations and suggest troubleshooting steps
+        #[arg(long)]
+        explain: bool,
         /// Emit machine-readable JSON instead of styled text
         #[arg(long, global = true)]
         json: bool,

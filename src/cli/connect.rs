@@ -211,6 +211,64 @@ struct NetcheckOutput {
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
     udp: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    advice: Vec<NetcheckAdvice>,
+}
+
+#[derive(serde::Serialize)]
+struct NetcheckAdvice {
+    code: &'static str,
+    observation: &'static str,
+    next_step: &'static str,
+}
+
+impl NetcheckOutput {
+    /// Interpret only what the local snapshot establishes. In particular, a
+    /// missing UDP result can mean the endpoint's first report is still pending,
+    /// and a preferred relay does not prove that any particular peer uses it.
+    fn explanation(&self) -> Vec<NetcheckAdvice> {
+        let mut advice = Vec::new();
+        if self.bound_port == 0 {
+            advice.push(NetcheckAdvice {
+                code: "no_bound_port",
+                observation: "No bound UDP port was reported.",
+                next_step: "Retry ray netcheck after startup; if it persists, inspect ray logs.",
+            });
+        } else if !self.port_is_fixed {
+            advice.push(NetcheckAdvice {
+                code: "ephemeral_port",
+                observation: "The endpoint is using a fallback UDP port.",
+                next_step: "If you forward a router port, use the reported port. Check whether another process holds port 41383; the fallback may change after a restart.",
+            });
+        }
+        if !self.udp {
+            advice.push(NetcheckAdvice {
+                code: "udp_unconfirmed",
+                observation: "Public UDP reachability has not been confirmed; the report may still be initializing.",
+                next_step: "Retry ray netcheck, then use ray ping <peer> to test a real connection. A relay may still work when direct UDP is unavailable.",
+            });
+        }
+        if self.home_relay.is_none() {
+            advice.push(NetcheckAdvice {
+                code: "relay_unreported",
+                observation: "No home relay has been reported yet.",
+                next_step: "If peers are unreachable, check internet access, DNS, and configured relay servers with ray logs.",
+            });
+        }
+        if self.public_ipv6.is_none() {
+            advice.push(NetcheckAdvice {
+                code: "no_public_ipv6",
+                observation: "No public IPv6 address was reported. Mesh IPv6 can still travel over IPv4 or a relay.",
+                next_step: "Use ray ping <peer> to check reachability before changing host IPv6 settings.",
+            });
+        }
+        advice.push(NetcheckAdvice {
+            code: "probe_peer",
+            observation: "These observations describe the local endpoint, not a peer's selected path or access to a service.",
+            next_step: "Run ray ping <peer> for a live mesh probe. If it succeeds but a service fails, check the service listener and ray firewall show.",
+        });
+        advice
+    }
 }
 
 impl DisplayOut for NetcheckOutput {
@@ -264,6 +322,10 @@ impl DisplayOut for NetcheckOutput {
                 .map(|s| style::value(s))
                 .unwrap_or_else(na)
         );
+        for advice in &self.advice {
+            println!("\n  {}", style::value(advice.observation));
+            println!("    {}", style::faint(advice.next_step));
+        }
     }
 }
 
@@ -413,7 +475,7 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
     Ok(())
 }
 
-pub(crate) async fn ipc_netcheck() -> Result<()> {
+pub(crate) async fn ipc_netcheck(explain: bool) -> Result<()> {
     match ipc_request(ipc::IpcMessage::Netcheck).await? {
         ipc::IpcMessage::NetcheckResponse {
             bound_port,
@@ -424,7 +486,7 @@ pub(crate) async fn ipc_netcheck() -> Result<()> {
             public_ipv6,
             udp,
         } => {
-            printout(&NetcheckOutput {
+            let mut output = NetcheckOutput {
                 bound_port,
                 port_is_fixed,
                 home_relay,
@@ -432,7 +494,12 @@ pub(crate) async fn ipc_netcheck() -> Result<()> {
                 public_ipv4,
                 public_ipv6,
                 udp,
-            })?;
+                advice: Vec::new(),
+            };
+            if explain {
+                output.advice = output.explanation();
+            }
+            printout(&output)?;
         }
         ipc::IpcMessage::Error { message } => fail_with("error", &message),
         other => fail_unexpected(&other),
@@ -467,6 +534,88 @@ pub(crate) async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> 
         other => fail_unexpected(&other),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod netcheck_tests {
+    use super::*;
+
+    fn output() -> NetcheckOutput {
+        NetcheckOutput {
+            bound_port: 41383,
+            port_is_fixed: true,
+            home_relay: Some("https://relay.example/".into()),
+            relay_latency_ms: Some(12.0),
+            public_ipv4: Some("192.0.2.1:41383".into()),
+            public_ipv6: Some("[2001:db8::1]:41383".into()),
+            udp: true,
+            advice: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn netcheck_explanations_do_not_mistake_initializing_reports_for_failures() {
+        let mut output = output();
+        output.udp = false;
+        output.home_relay = None;
+        output.public_ipv6 = None;
+        let advice = output.explanation();
+        let udp = advice.iter().find(|a| a.code == "udp_unconfirmed").unwrap();
+        assert!(udp.observation.contains("initializing"));
+        assert!(udp.next_step.contains("relay may still work"));
+        assert!(advice.iter().any(|a| a.code == "relay_unreported"));
+        let ipv6 = advice.iter().find(|a| a.code == "no_public_ipv6").unwrap();
+        assert!(ipv6.observation.contains("over IPv4 or a relay"));
+    }
+
+    #[test]
+    fn netcheck_explains_fallback_ports_only_when_a_socket_is_reported() {
+        let mut output = output();
+        output.port_is_fixed = false;
+        output.bound_port = 54321;
+        let advice = output.explanation();
+        assert!(advice.iter().any(|a| a.code == "ephemeral_port"));
+        assert!(!advice.iter().any(|a| a.code == "no_bound_port"));
+        output.bound_port = 0;
+        let advice = output.explanation();
+        assert!(advice.iter().any(|a| a.code == "no_bound_port"));
+        assert!(!advice.iter().any(|a| a.code == "ephemeral_port"));
+    }
+
+    #[test]
+    fn netcheck_keeps_local_observations_separate_from_peer_health() {
+        let advice = output().explanation();
+        assert_eq!(advice.len(), 1);
+        assert_eq!(advice[0].code, "probe_peer");
+        assert!(advice[0].next_step.contains("ray ping <peer>"));
+        assert!(advice[0].next_step.contains("ray firewall show"));
+    }
+
+    #[test]
+    fn netcheck_explanation_is_opt_in_in_both_json_and_command_line() {
+        let mut output = output();
+        let plain = serde_json::to_value(&output).unwrap();
+        assert!(plain.get("advice").is_none());
+        assert_eq!(plain.as_object().unwrap().len(), 7);
+        output.advice = output.explanation();
+        let explained = serde_json::to_value(&output).unwrap();
+        assert_eq!(explained["advice"][0]["code"], "probe_peer");
+        for (key, value) in plain.as_object().unwrap() {
+            assert_eq!(&explained[key], value);
+        }
+
+        let cli = Cli::try_parse_from(["ray", "netcheck", "--explain", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Netcheck { explain: true, .. }
+        ));
+        assert!(json_requested(&cli.command));
+        let cli = Cli::try_parse_from(["ray", "netcheck"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Netcheck { explain: false, .. }
+        ));
+    }
 }
 
 #[cfg(test)]

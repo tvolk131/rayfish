@@ -137,7 +137,7 @@ fn json_requested(command: &Command) -> bool {
         | Command::Connect { json, .. }
         | Command::Connections { json, .. }
         | Command::Ping { json, .. }
-        | Command::Netcheck { json }
+        | Command::Netcheck { json, .. }
         | Command::Admin { json, .. }
         | Command::Firewall { json, .. }
         | Command::Ssh { json, .. }
@@ -392,7 +392,7 @@ async fn run() -> Result<()> {
             interval,
             json: _,
         } => ipc_ping(&peer, count, interval).await,
-        Command::Netcheck { json: _ } => ipc_netcheck().await,
+        Command::Netcheck { explain, .. } => ipc_netcheck(explain).await,
         Command::Admin {
             network,
             action,
