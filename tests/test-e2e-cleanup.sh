@@ -6,8 +6,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_TMP="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMP"' EXIT
 
-source <(sed -n '/^servers_backend(){/,/^}/p' "$ROOT/tests/lib/docker.sh")
-source <(sed -n '/^do_teardown(){/,/^}/p' "$ROOT/tests/lib/docker.sh")
+sed -n '/^servers_backend(){/,/^}/p; /^do_teardown(){/,/^}/p' \
+  "$ROOT/tests/lib/docker.sh" > "$TEST_TMP/cleanup-functions.sh"
+source "$TEST_TMP/cleanup-functions.sh"
 
 check(){
   if "$@" > "$TEST_TMP/check-output" 2>&1; then

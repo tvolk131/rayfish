@@ -7,6 +7,13 @@ trap 'rm -rf "$TEST_TMP"' EXIT
 # shellcheck source=lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 
+# The mocked hosts run locally. macOS has setsid(2), but no setsid command;
+# provide the same session detachment for the Linux listener helpers under test.
+if ! command -v setsid >/dev/null 2>&1; then
+  setsid(){ python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+  export -f setsid
+fi
+
 check(){
   if "$@" > "$TEST_TMP/check-output" 2>&1; then
     printf 'PASS %s\n' "$*"
@@ -119,7 +126,8 @@ network_absence(){ (
 
 diagnostics(){ (
   # Exercise the dispatcher's actual function without provisioning a fleet.
-  source <(sed -n '/^dump_diagnostics(){/,/^}/p' "$ROOT/tests/e2e.sh")
+  sed -n '/^dump_diagnostics(){/,/^}/p' "$ROOT/tests/e2e.sh" > "$TEST_TMP/diagnostic-functions.sh"
+  source "$TEST_TMP/diagnostic-functions.sh"
   local SERVERS="$TEST_TMP/diagnostic-servers" E2E_BACKEND=docker
   local SSH_KEY="$TEST_TMP/custom-key" scenario=closed-net
   printf 'a 1 srv-a docker\nb 2 srv-b docker\nc 3 srv-c docker\n' > "$SERVERS"
@@ -265,7 +273,7 @@ source "$1/tests/lib/common.sh"
 on(){
   local cmd="$2"
   # Interrupt after bind/readiness, without allowing the harness to clean up.
-  if [[ "$cmd" == *'sendto('* ]]; then kill -TERM "$BASHPID"; return 1; fi
+  if [[ "$cmd" == *'sendto('* ]]; then kill -TERM "$$"; return 1; fi
   # Shorten only the receiver's own deadline to keep this regression check fast.
   cmd="${cmd/s.settimeout(60)/s.settimeout(0.2)}"
   bash -c "$cmd"

@@ -7,7 +7,8 @@ trap 'rm -rf "$TEST_TMP"' EXIT
 # shellcheck source=lib/common.sh
 source "$ROOT/tests/lib/common.sh"
 # Load the actual scenario helper without provisioning or executing its flow.
-source <(sed -n '/^check_unknown_peer(){/,/^}/p' "$ROOT/tests/e2e/connect/run.sh")
+sed -n '/^check_unknown_peer(){/,/^}/p' "$ROOT/tests/e2e/connect/run.sh" > "$TEST_TMP/connect-functions.sh"
+source "$TEST_TMP/connect-functions.sh"
 
 unknown_case(){ (
   local mode="$1" expected="$2" rc=0

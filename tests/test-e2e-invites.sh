@@ -5,7 +5,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_TMP="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMP"' EXIT
 source "$ROOT/tests/lib/common.sh"
-source <(sed -n '/^check_older_recipient(){/,/^}/p' "$ROOT/tests/e2e/invites/run.sh")
+sed -n '/^check_older_recipient(){/,/^}/p' "$ROOT/tests/e2e/invites/run.sh" > "$TEST_TMP/invite-functions.sh"
+source "$TEST_TMP/invite-functions.sh"
 
 legacy_case(){ (
   local mode="$1" expected="$2" rc=0
