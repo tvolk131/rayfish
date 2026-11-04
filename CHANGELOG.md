@@ -20,6 +20,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   independently after revocation no longer retains its former primary's
   firewall or SSH identity.
 
+### Performance
+
+- Preparing connection attempts uses less CPU on networks with many
+  coordinators, while preserving their dial order.
+
 ## [0.5.15] - 2026-11-03
 
 ### Fixed

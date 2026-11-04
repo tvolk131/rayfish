@@ -14,12 +14,13 @@ pub(crate) fn coordinator_dial_order(
     me: EndpointId,
 ) -> Vec<EndpointId> {
     let mut order = Vec::new();
-    let is_coord = |id: EndpointId| members.iter().any(|m| m.identity == id && m.is_coordinator);
-    if minter != me && is_coord(minter) {
+    if minter != me && members.get(&minter).is_some_and(|m| m.is_coordinator) {
         order.push(minter);
     }
+    // MemberList is uniquely keyed by identity. Only the minter can already be
+    // in the output, so avoid scanning the growing vector for every coordinator.
     for m in members {
-        if m.is_coordinator && m.identity != me && !order.contains(&m.identity) {
+        if m.is_coordinator && m.identity != me && m.identity != minter {
             order.push(m.identity);
         }
     }
