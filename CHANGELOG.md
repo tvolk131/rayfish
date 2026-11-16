@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Bulk TCP transfers between peers whose packets are split in two, such as
+  macOS peers, could drop to about 1 MB/s per connection on fast direct paths.
+  When the send queue overflowed, part of an already queued packet was
+  discarded, losing that packet too. Overflow now drops only whole new packets,
+  counted in metrics as `send_queue_full`.
+
 ## [0.5.15] - 2026-11-03
 
 ### Fixed

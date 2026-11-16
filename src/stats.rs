@@ -53,6 +53,10 @@ pub enum DropReason {
     QueueDelay,
     /// The bounded flow scheduler exhausted its retention budget.
     QueueFull,
+    /// The standalone engine refused a whole outbound packet because QUIC's
+    /// datagram send buffer had no room for it. Refusing it here keeps QUIC
+    /// from discarding part of an already queued packet instead.
+    SendQueueFull,
     /// The TUN device delivered a packet its reader could not decode, such as a
     /// Linux offload record needing more segments than tun-rs can split it
     /// into. Only that packet is lost; the forwarding loop keeps reading.
@@ -60,7 +64,7 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    const ALL: [DropReason; 15] = [
+    const ALL: [DropReason; 16] = [
         DropReason::Firewall,
         DropReason::SendFailure,
         DropReason::NoPeer,
@@ -75,6 +79,7 @@ impl DropReason {
         DropReason::DnsConcurrency,
         DropReason::QueueDelay,
         DropReason::QueueFull,
+        DropReason::SendQueueFull,
         DropReason::TunRead,
     ];
 }
@@ -500,6 +505,7 @@ mod tests {
                 | DropReason::DnsConcurrency
                 | DropReason::QueueDelay
                 | DropReason::QueueFull
+                | DropReason::SendQueueFull
                 | DropReason::TunRead => 1,
             }
         });

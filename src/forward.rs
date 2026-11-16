@@ -1095,43 +1095,35 @@ async fn send_routed(
         });
         sender.enqueue(info, route.handle, encoded, n);
     } else {
-        let datagrams = encoded.datagrams();
-        send_batch(ctx, route, datagrams, &[(datagrams.len(), n)]);
+        send_packet(ctx, route, encoded.datagrams(), n);
     }
     true
 }
 
-/// Hands an ordered run of datagrams to noq. `packets` records the end index and
-/// original IP length of each packet, so fragmentation does not inflate traffic
-/// counters. noQ may discard older queued datagrams when its bounded send buffer
-/// is full; QUIC datagrams are intentionally unreliable and the forwarding path
-/// never waits for capacity.
-fn send_batch(ctx: &SendCtx<'_>, route: &PeerRoute, batch: &[Bytes], packets: &[(usize, usize)]) {
-    if batch.is_empty() || !ctx.active.load(Ordering::Acquire) {
+/// Hands one packet's datagrams to noq. `len` is the original IP length, so
+/// fragmentation does not inflate traffic counters. The forwarding path never
+/// waits for capacity: QUIC datagrams are intentionally unreliable.
+fn send_packet(ctx: &SendCtx<'_>, route: &PeerRoute, datagrams: &[Bytes], len: usize) {
+    if datagrams.is_empty() || !ctx.active.load(Ordering::Acquire) {
         return;
     }
-    match route.conn.send_many_datagrams(batch) {
-        Ok(queued) => {
-            for &(end, len) in packets {
-                if end <= queued {
-                    ctx.stats.record_tx(len);
-                } else {
-                    ctx.stats.record_drop(DropReason::SendFailure);
-                }
-            }
-            if queued > 0 {
-                route.note_activity();
-            }
+    if !queue_whole_packet(&route.conn, datagrams) {
+        ctx.stats.record_drop(DropReason::SendQueueFull);
+        return;
+    }
+    match route.conn.send_many_datagrams(datagrams) {
+        Ok(queued) if queued == datagrams.len() => {
+            ctx.stats.record_tx(len);
+            route.note_activity();
         }
+        Ok(_) => ctx.stats.record_drop(DropReason::SendFailure),
         Err(error) => {
             tracing::debug!(
                 peer = %route.endpoint_id.fmt_short(),
                 %error,
                 "datagram send failed"
             );
-            for _ in packets {
-                ctx.stats.record_drop(DropReason::SendFailure);
-            }
+            ctx.stats.record_drop(DropReason::SendFailure);
         }
     }
 }
@@ -1377,9 +1369,31 @@ pub fn spawn_peer_reader(
 fn send_peer_reply(conn: &Connection, handle: u16, reply: &[u8]) {
     if let Some(max) = conn.max_datagram_size()
         && let Some(encoded) = fragment::encode(handle, reply, max)
+        && queue_whole_packet(conn, encoded.datagrams())
     {
         let _ = conn.send_many_datagrams(encoded.datagrams());
     }
+}
+
+/// Whether noq's datagram send buffer has room for all of one packet's
+/// datagrams without discarding anything already queued.
+///
+/// When that buffer is full, noq makes room by discarding the oldest queued
+/// datagrams. A mesh fragment is a datagram, so that can drop one fragment of
+/// an already queued packet. The peer then holds the rest in its reassembler
+/// until the packet times out or is evicted, and the packet is lost anyway.
+/// Under a sustained burst, such as bulk TCP whose full-sized packets each
+/// need two fragments, that loss is continuous. Refusing the new packet whole
+/// instead loses one packet per overflow, keeps every queued packet complete,
+/// and lets the caller count the drop, which noq does not.
+///
+/// The check and the send are separate calls. The QUIC driver only frees space
+/// in between, but another sender on the same connection, such as a peer reply
+/// or a liveness ping, can still fill it. This narrows that case to a race
+/// between two sends rather than closing it.
+fn queue_whole_packet(conn: &Connection, datagrams: &[Bytes]) -> bool {
+    let bytes: usize = datagrams.iter().map(Bytes::len).sum();
+    conn.datagram_send_buffer_space() >= bytes
 }
 
 /// Minimum gap between two TUN write failure or oversize-drop warnings.

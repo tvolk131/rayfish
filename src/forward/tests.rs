@@ -211,6 +211,124 @@ async fn v5_connection_sends_only_whole_packets() {
     b.close().await;
 }
 
+/// A burst larger than the standalone send buffer loses whole packets, never
+/// one fragment of a queued packet. On this current-thread runtime the QUIC
+/// driver cannot run between back-to-back sends, so the burst always
+/// overflows. Before this was guarded, noq discarded the oldest datagrams to
+/// make room and could leave a lone fragment at the head of the queue.
+#[tokio::test]
+async fn standalone_send_buffer_overflow_drops_whole_packets() {
+    use iroh::endpoint::{QuicTransportConfig, presets};
+    use iroh::{Endpoint, RelayMode};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let buffer = crate::transport::datagram_send_buffer_size(QuicEngine::Standalone);
+    let endpoint = || async {
+        Endpoint::builder(presets::N0)
+            .alpns(vec![crate::transport::mesh_alpn()])
+            .relay_mode(RelayMode::Disabled)
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .initial_mtu(1200)
+                    .datagram_send_buffer_size(buffer)
+                    .mtu_discovery_config(None)
+                    .build(),
+            )
+            .bind()
+            .await
+            .unwrap()
+    };
+    let a = endpoint().await;
+    let b = endpoint().await;
+    let connect = async {
+        let alpn = crate::transport::mesh_alpn();
+        let (send, recv) = tokio::join!(a.connect(b.addr(), &alpn), async {
+            b.accept().await.unwrap().await.unwrap()
+        });
+        (send.unwrap(), recv)
+    };
+    let (send, recv) = timeout(Duration::from_secs(5), connect).await.unwrap();
+    let a_ip = crate::membership::derive_ipv6(&a.id());
+    let b_ip = crate::membership::derive_ipv6(&b.id());
+    let peers = PeerTable::new();
+    peers.add(b_ip, send.clone(), b.id(), "test");
+    peers.note_receive_mtu(&b.id(), &send, crate::tun::TUN_MTU);
+    let route = peers.lookup_v6(&b_ip).unwrap();
+    assert!(
+        route.scheduler.is_none(),
+        "the standalone engine is the default"
+    );
+    let fw = inbound_fw(Action::Allow, vec![]);
+    let stats = Arc::new(ForwardMetrics::default());
+    let (feedback_tx, _feedback_rx) = mpsc::channel(4);
+    let ctx = SendCtx {
+        active: &Arc::new(AtomicBool::new(true)),
+        firewall: &fw,
+        peers: &peers,
+        stats: &stats,
+        tun_tx: &feedback_tx,
+    };
+
+    let len = usize::from(crate::tun::TUN_MTU);
+    let packets: Vec<Bytes> = (0..40u8)
+        .map(|n| {
+            let mut packet = make_tcp_packet_between(a_ip, b_ip, 22);
+            packet.resize(len, n);
+            packet[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+            Bytes::from(packet)
+        })
+        .collect();
+    let max = send.max_datagram_size().unwrap();
+    let wire = fragment::wire_size(len, max).unwrap();
+    assert!(len + TAG_LEN > max, "each packet must need two datagrams");
+    let fits = buffer / wire;
+    assert!(fits > 0 && fits < packets.len(), "the burst must overflow");
+
+    for packet in &packets {
+        let info = firewall::parse_packet_info(packet).unwrap();
+        send_over_route(&ctx, &route, &info, packet.clone()).await;
+    }
+    assert_eq!(
+        buffer - send.datagram_send_buffer_space(),
+        fits * wire,
+        "only whole packets are queued"
+    );
+    assert_eq!(stats.packets_tx.get(), fits as u64);
+    assert_eq!(
+        stats.drop_count(DropReason::SendQueueFull),
+        (packets.len() - fits) as u64
+    );
+
+    let mut reassembly = fragment::Reassembler::default();
+    let mut received = Vec::new();
+    while received.len() < fits {
+        let datagram = timeout(Duration::from_secs(5), recv.read_datagram())
+            .await
+            .expect("queued packets arrive")
+            .unwrap();
+        if let Some(packet) = reassembly
+            .accept(datagram, tokio::time::Instant::now())
+            .unwrap()
+        {
+            received.push(packet);
+        }
+    }
+    assert_eq!(received, &packets[..fits]);
+    assert!(
+        timeout(Duration::from_millis(200), recv.read_datagram())
+            .await
+            .is_err(),
+        "nothing past the queued packets was sent"
+    );
+    assert!(
+        reassembly.deadline().is_none(),
+        "no fragment is left waiting for its packet"
+    );
+    a.close().await;
+    b.close().await;
+}
+
 /// Exercise the production sender, lazy-dial batch flush and receiver over
 /// real QUIC, with discovery disabled so full IP packets need fragmentation
 /// even on loopback.
